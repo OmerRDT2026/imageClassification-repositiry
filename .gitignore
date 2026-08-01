@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (if you ever add tooling)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# App-generated data — regenerable, and some of it is large/binary
+uploads/
+converted/
+iap_model*.pkl
+
+# Uploaded rasters — these are large binary orthomosaics, not source code
+*.tif
+*.tiff
