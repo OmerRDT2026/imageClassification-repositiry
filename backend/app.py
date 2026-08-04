@@ -110,7 +110,9 @@ def detect_band_order(src):
         print(f"No usable band descriptions found (raw: {descriptions}) — "
               f"falling back to the default Blue=0,Green=1,Red=2,NIR=3 layout. "
               f"If this sensor uses a different band order, results will be wrong.")
-        return dict(BAND_ORDER), False
+        fallback = dict(BAND_ORDER)
+        fallback.update({'swir': None, 'red_edge': None, 'alpha': None})
+        return fallback, False
 
     if roles['blue'] is None:
         # Common on ag-focused sensors that skip Blue entirely. Green is the
