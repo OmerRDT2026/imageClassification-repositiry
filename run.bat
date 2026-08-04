@@ -12,12 +12,32 @@ set "REQUIREMENTS_FILE=%PROJECT_DIR%requirements.txt"
 set "RUNTIME_DIR=%PROJECT_DIR%python_runtime"
 set "PYTHON_EXE="
 
-REM ── STEP 1: Check for bundled Python runtime first ────────────────
+REM ── STEP 1: Check for bundled Python runtime ─────────────────────
+REM The installer may place python.exe in a subfolder, so search
+REM all likely locations inside python_runtime\.
 if exist "%RUNTIME_DIR%\python.exe" (
     echo Found bundled Python runtime.
     set "PYTHON_EXE=%RUNTIME_DIR%\python.exe"
     goto :deps_check
 )
+if exist "%RUNTIME_DIR%\Python311\python.exe" (
+    echo Found bundled Python runtime in Python311 subfolder.
+    set "PYTHON_EXE=%RUNTIME_DIR%\Python311\python.exe"
+    goto :deps_check
+)
+if exist "%RUNTIME_DIR%\Python\python.exe" (
+    echo Found bundled Python runtime in Python subfolder.
+    set "PYTHON_EXE=%RUNTIME_DIR%\Python\python.exe"
+    goto :deps_check
+)
+REM Deep search: walk the runtime dir for any python.exe
+for /r "%RUNTIME_DIR%" %%F in (python.exe) do (
+    if "!PYTHON_EXE!"=="" (
+        echo Found bundled Python at %%F
+        set "PYTHON_EXE=%%F"
+    )
+)
+if not "!PYTHON_EXE!"=="" goto :deps_check
 
 REM ── STEP 2: Check for a REAL system Python ───────────────────────
 python --version >nul 2>nul
@@ -42,7 +62,7 @@ if not errorlevel 1 (
     )
 )
 
-REM ── STEP 3: No real Python found — download and install ──────────
+REM ── STEP 3: No Python found — download and install ───────────────
 echo.
 echo No Python installation was found on this computer.
 echo Downloading Python 3.11.9 (~25 MB, one-time only)...
@@ -70,7 +90,7 @@ echo Downloading from %PY_URL%...
 powershell -Command "& { $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '%PY_URL%' -OutFile '%PY_INSTALLER%' }"
 
 if not exist "%PY_INSTALLER%" (
-    echo ERROR: Download failed. Check your internet connection and try again.
+    echo ERROR: Download failed. Check your internet connection.
     pause
     exit /b 1
 )
@@ -78,19 +98,41 @@ if not exist "%PY_INSTALLER%" (
 echo Installing Python into "%RUNTIME_DIR%"...
 echo This will take about 60 seconds, please wait.
 "%PY_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=0 TargetDir="%RUNTIME_DIR%" Include_launcher=0 Include_test=0
-if errorlevel 1 (
-    echo ERROR: Python installation failed.
-    del "%PY_INSTALLER%" >nul 2>nul
+
+REM Wait a moment for installer to fully finish writing files
+timeout /t 5 /nobreak >nul
+
+del "%PY_INSTALLER%" >nul 2>nul
+
+REM Find python.exe wherever the installer put it
+for /r "%RUNTIME_DIR%" %%F in (python.exe) do (
+    if "!PYTHON_EXE!"=="" (
+        set "PYTHON_EXE=%%F"
+    )
+)
+
+if "!PYTHON_EXE!"=="" (
+    echo.
+    echo ERROR: Python was downloaded and installed but python.exe
+    echo could not be found inside "%RUNTIME_DIR%".
+    echo Contents of runtime folder:
+    dir "%RUNTIME_DIR%" /b
+    echo.
+    echo Please install Python manually from https://python.org
     pause
     exit /b 1
 )
 
-del "%PY_INSTALLER%" >nul 2>nul
-set "PYTHON_EXE=%RUNTIME_DIR%\python.exe"
-echo Python installed successfully.
+echo Python installed successfully at !PYTHON_EXE!
 
 REM ── STEP 4: Verify backend exists ────────────────────────────────
 :deps_check
+if "!PYTHON_EXE!"=="" (
+    echo ERROR: No Python found. Cannot continue.
+    pause
+    exit /b 1
+)
+
 if not exist "%BACKEND_DIR%\app.py" (
     echo ERROR: Could not find "%BACKEND_DIR%\app.py"
     echo Make sure run.bat is in the project root alongside index.html.
@@ -99,7 +141,7 @@ if not exist "%BACKEND_DIR%\app.py" (
 )
 
 REM ── STEP 5: Install dependencies if not already present ──────────
-"%PYTHON_EXE%" -c "import flask, geopandas, rasterio, sklearn" >nul 2>nul
+"!PYTHON_EXE!" -c "import flask, geopandas, rasterio, sklearn" >nul 2>nul
 if not errorlevel 1 (
     echo Dependencies already installed. Starting server...
     goto :start_server
@@ -115,12 +157,14 @@ echo Installing dependencies (one-time, may take 2-5 minutes)...
 echo Please wait - do not close this window.
 echo.
 
-"%PYTHON_EXE%" -m pip install fiona==1.9.5 --quiet --disable-pip-version-check --no-warn-script-location
-"%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%" --quiet --disable-pip-version-check --no-warn-script-location
+"!PYTHON_EXE!" -m pip install fiona==1.9.5 --quiet --disable-pip-version-check --no-warn-script-location
+"!PYTHON_EXE!" -m pip install -r "%REQUIREMENTS_FILE%" --quiet --disable-pip-version-check --no-warn-script-location
 if errorlevel 1 (
+    echo.
     echo ERROR: Failed to install packages.
     echo Run this manually to see the full error:
-    echo "%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%"
+    echo "!PYTHON_EXE!" -m pip install -r "%REQUIREMENTS_FILE%"
+    echo.
     pause
     exit /b 1
 )
@@ -130,7 +174,7 @@ REM ── STEP 6: Start server ────────────────
 :start_server
 echo.
 echo Starting the server...
-start "Multispectral Image Analysis - Keep This Window Open" cmd /k "cd /d "%BACKEND_DIR%" && "%PYTHON_EXE%" app.py"
+start "Multispectral Image Analysis - Keep This Window Open" cmd /k "cd /d "%BACKEND_DIR%" && "!PYTHON_EXE!" app.py"
 
 echo Waiting for server to be ready...
 set "READY=0"
@@ -152,8 +196,6 @@ if "!READY!"=="1" (
     echo   http://localhost:5000
     echo ============================================================
     echo.
-    REM Open http://localhost:5000 explicitly in Chrome or Edge.
-    REM Never open the file path — Chrome blocks large uploads from file://
     set "OPENED=0"
     if "!OPENED!"=="0" if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" (
         start "" "%ProgramFiles%\Google\Chrome\Application\chrome.exe" "http://localhost:5000"
@@ -178,7 +220,7 @@ if "!READY!"=="1" (
     echo.
     echo Server did not respond after 40 seconds.
     echo Check the server window for error details.
-    echo If it looks like it started, open your browser and go to:
+    echo If it looks like it started, open your browser manually and go to:
     echo http://localhost:5000
     echo.
 )
