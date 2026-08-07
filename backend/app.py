@@ -22,6 +22,20 @@ from scipy.stats import mode as scipy_mode
 app = Flask(__name__)
 CORS(app)
 
+# Project layout: app.py lives in backend/, while index.html and frontend/
+# sit one level up, at the project root.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@app.route('/')
+def serve_index():
+    return send_file(os.path.join(PROJECT_ROOT, 'index.html'))
+
+
+@app.route('/frontend/<path:filename>')
+def serve_frontend(filename):
+    return send_file(os.path.join(PROJECT_ROOT, 'frontend', filename))
+
 UPLOAD_FOLDER    = 'uploads'
 CONVERTED_FOLDER = 'converted'
 os.makedirs(UPLOAD_FOLDER,    exist_ok=True)
@@ -773,7 +787,10 @@ def classify_iap():
                 if not os.path.exists(GEOJSON_PATH):
                     return jsonify({'error': f'Training polygons not found at {GEOJSON_PATH}'}), 500
 
-                gdf = gpd.read_file(GEOJSON_PATH)
+                try:
+                    gdf = gpd.read_file(GEOJSON_PATH, engine='pyogrio')
+                except Exception:
+                    gdf = gpd.read_file(GEOJSON_PATH)
                 gdf = gdf[gdf[CLASS_FIELD].notna()].copy()
 
                 # training_data.geojson's coordinates are written in
@@ -966,6 +983,95 @@ def classify_iap():
                 numeric_2d.reshape(-1)[valid_mask] = pred_encoded
                 no_data_2d = no_data_flat.reshape(height, width)
                 prob_2d.reshape(-1)[valid_mask] = max_probs
+
+            # ── BANKROT BOS SPATIAL CONSTRAINT ────────────────────────────────
+            # The model was trained on Bankrot Bos polygons drawn in a specific
+            # area. Outside those polygons it can confuse shadows with Bankrot Bos.
+            #
+            # This block detects whether the uploaded image actually overlaps the
+            # Bankrot Bos training polygon area:
+            #
+            # CASE A — image OVERLAPS training polygons (your survey area):
+            #   - Inside polygons  → always show Bankrot Bos (ground truth)
+            #   - Outside polygons → only show if confidence >= BANKROT_OUTSIDE_THRESHOLD
+            #
+            # CASE B — image does NOT overlap (different farm/area entirely):
+            #   - No spatial constraint applied
+            #   - Falls back to standard confidence threshold from DEMOTION_RULES
+            #   - Bankrot Bos can still be predicted if model is confident enough
+            #
+            # Tuning knobs:
+            #   BANKROT_OUTSIDE_THRESHOLD (0.92): raise → only show where drawn,
+            #     lower → allow more detections outside drawn polygons
+            #   inside force-paint threshold (0.40): lower → paint more of the
+            #     polygon interior, raise → only paint high-confidence interior px
+            BANKROT_OUTSIDE_THRESHOLD  = 0.92
+            BANKROT_INSIDE_MIN_CONF    = 0.40
+
+            if 'Bankrot Bos' in class_names:
+                bb_idx  = class_names.index('Bankrot Bos')
+                grs_idx = class_names.index('Grassland') if 'Grassland' in class_names else 0
+
+                try:
+                    bb_polys = gdf[gdf[CLASS_FIELD] == 'Bankrot Bos']
+
+                    # Check if the training polygons actually overlap this image
+                    # by comparing bounding boxes in the raster CRS.
+                    image_bounds = src.bounds  # (left, bottom, right, top)
+                    if len(bb_polys) > 0:
+                        poly_bounds = bb_polys.total_bounds  # (minx, miny, maxx, maxy)
+                        overlaps = (
+                            poly_bounds[0] < image_bounds.right  and
+                            poly_bounds[2] > image_bounds.left   and
+                            poly_bounds[1] < image_bounds.top    and
+                            poly_bounds[3] > image_bounds.bottom
+                        )
+                    else:
+                        overlaps = False
+
+                    if overlaps:
+                        # CASE A: image covers the Bankrot Bos survey area
+                        print("  Bankrot Bos spatial constraint: polygon zone overlaps image — applying constraint")
+                        bb_shapes = [
+                            (mapping(geom), 1)
+                            for geom in bb_polys.geometry
+                            if geom is not None and not geom.is_empty
+                        ]
+                        bankrot_zone = rasterio.features.rasterize(
+                            bb_shapes,
+                            out_shape=(height, width),
+                            transform=src.transform,
+                            fill=0,
+                            dtype=np.uint8,
+                        ).astype(bool)
+
+                        # Inside polygon zone → force-paint as Bankrot Bos
+                        # for any pixel with enough confidence
+                        inside_confident = (
+                            bankrot_zone &
+                            (prob_2d >= BANKROT_INSIDE_MIN_CONF) &
+                            ~no_data_2d
+                        )
+                        numeric_2d[inside_confident] = bb_idx
+
+                        # Outside polygon zone → very high confidence required
+                        outside_zone = ~bankrot_zone & ~no_data_2d
+                        low_conf_outside = (
+                            outside_zone &
+                            (numeric_2d == bb_idx) &
+                            (prob_2d < BANKROT_OUTSIDE_THRESHOLD)
+                        )
+                        numeric_2d[low_conf_outside] = grs_idx
+                        print(f"    {bankrot_zone.sum():,} px in polygon zone, "
+                              f"{low_conf_outside.sum():,} px outside demoted → Grassland")
+                    else:
+                        # CASE B: completely different image — no spatial constraint
+                        # Standard DEMOTION_RULES threshold already applied above
+                        print("  Bankrot Bos spatial constraint: polygon zone does NOT overlap "
+                              "this image — skipping constraint, using standard confidence threshold")
+
+                except Exception as e:
+                    print(f"  Bankrot Bos spatial constraint failed (non-fatal): {e}")
 
             # ── SMOOTHING & VISUALIZATION (Same as before) ──────────────────
             unique_classes = np.unique(numeric_2d[numeric_2d != 255])
