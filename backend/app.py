@@ -22,6 +22,20 @@ from scipy.stats import mode as scipy_mode
 app = Flask(__name__)
 CORS(app)
 
+# Project layout: app.py lives in backend/, while index.html and frontend/
+# sit one level up, at the project root.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@app.route('/')
+def serve_index():
+    return send_file(os.path.join(PROJECT_ROOT, 'index.html'))
+
+
+@app.route('/frontend/<path:filename>')
+def serve_frontend(filename):
+    return send_file(os.path.join(PROJECT_ROOT, 'frontend', filename))
+
 UPLOAD_FOLDER    = 'uploads'
 CONVERTED_FOLDER = 'converted'
 os.makedirs(UPLOAD_FOLDER,    exist_ok=True)
@@ -57,6 +71,16 @@ PREVIEW_MAX_EDGE = 2500
 # into Bare Soil when this file was built, so no merging happens at request
 # time any more.
 GEOJSON_PATH = os.path.join(os.path.dirname(__file__), 'training_data.geojson')
+
+# Seed images — rasters bundled with the deployment that the cross-image
+# fallback can always borrow training pixels from, even on a completely
+# fresh install with nothing yet in uploads/. Place your original training
+# images (the ones the polygons were digitized against) in this folder.
+# The folder is searched AFTER uploads/ so locally-uploaded images always
+# take priority as pixel sources. Seed images are never served to the user
+# and are never deleted by the app.
+SEED_IMAGES_DIR = os.path.join(os.path.dirname(__file__), 'seed_images')
+os.makedirs(SEED_IMAGES_DIR, exist_ok=True)
 CLASS_FIELD  = 'class_name'
 
 # Fallback band layout, only used when a file has no usable per-band
@@ -110,7 +134,9 @@ def detect_band_order(src):
         print(f"No usable band descriptions found (raw: {descriptions}) — "
               f"falling back to the default Blue=0,Green=1,Red=2,NIR=3 layout. "
               f"If this sensor uses a different band order, results will be wrong.")
-        return dict(BAND_ORDER), False
+        fallback = dict(BAND_ORDER)
+        fallback.update({'swir': None, 'red_edge': None, 'alpha': None})
+        return fallback, False
 
     if roles['blue'] is None:
         # Common on ag-focused sensors that skip Blue entirely. Green is the
@@ -771,7 +797,10 @@ def classify_iap():
                 if not os.path.exists(GEOJSON_PATH):
                     return jsonify({'error': f'Training polygons not found at {GEOJSON_PATH}'}), 500
 
-                gdf = gpd.read_file(GEOJSON_PATH)
+                try:
+                    gdf = gpd.read_file(GEOJSON_PATH, engine='pyogrio')
+                except Exception:
+                    gdf = gpd.read_file(GEOJSON_PATH)
                 gdf = gdf[gdf[CLASS_FIELD].notna()].copy()
 
                 # training_data.geojson's coordinates are written in
@@ -800,10 +829,32 @@ def classify_iap():
                 X, y, local_counts = extract_training_samples(
                     input_path, gdf, class_list, class_to_id,
                 )
+                # If this image has zero local overlap with the training polygons,
+                # try seed images before giving up — this makes a fresh deployment
+                # work immediately without needing to upload the original images first.
+                if X.shape[0] == 0:
+                    print("No local training overlap — trying seed images as pixel source...")
+                    seed_files = [
+                        f for f in glob.glob(os.path.join(SEED_IMAGES_DIR, '*'))
+                        if os.path.isfile(f)
+                    ]
+                    for seed_path in seed_files:
+                        X_seed, y_seed, seed_counts = extract_training_samples(
+                            seed_path, gdf, class_list, class_to_id,
+                        )
+                        if X_seed.shape[0] > 0:
+                            X = X_seed
+                            y = y_seed
+                            local_counts = seed_counts
+                            print(f"  Bootstrapped training from seed image: {os.path.basename(seed_path)}")
+                            break
+
                 if X.shape[0] == 0:
                     return jsonify({
-                        'error': 'Training polygons do not overlap this image. '
-                                 'Please upload the original training image first to generate the model.'
+                        'error': 'Training polygons do not overlap this image and no seed images '
+                                 'are available. Add the original training rasters to '
+                                 'backend/seed_images/ so any image can be classified '
+                                 'on a fresh deployment.'
                     }), 400
 
                 training_sample_counts = {cls: local_counts.get(cls, 0) for cls in class_list}
@@ -824,9 +875,15 @@ def classify_iap():
                 if missing_classes:
                     print(f"Classes with zero local training pixels on this image: "
                           f"{missing_classes} — searching other uploaded images for fallback samples.")
+                    # Search uploads/ first (locally uploaded images take
+                    # priority as they're more likely to match this image's
+                    # geography), then seed_images/ as the guaranteed fallback.
                     other_files = [
                         f for f in glob.glob(os.path.join(app.config['UPLOAD_FOLDER'], '*'))
                         if os.path.abspath(f) != os.path.abspath(input_path) and os.path.isfile(f)
+                    ] + [
+                        f for f in glob.glob(os.path.join(SEED_IMAGES_DIR, '*'))
+                        if os.path.isfile(f)
                     ]
                     for other_path in other_files:
                         if not missing_classes:
@@ -964,6 +1021,95 @@ def classify_iap():
                 numeric_2d.reshape(-1)[valid_mask] = pred_encoded
                 no_data_2d = no_data_flat.reshape(height, width)
                 prob_2d.reshape(-1)[valid_mask] = max_probs
+
+            # ── BANKROT BOS SPATIAL CONSTRAINT ────────────────────────────────
+            # The model was trained on Bankrot Bos polygons drawn in a specific
+            # area. Outside those polygons it can confuse shadows with Bankrot Bos.
+            #
+            # This block detects whether the uploaded image actually overlaps the
+            # Bankrot Bos training polygon area:
+            #
+            # CASE A — image OVERLAPS training polygons (your survey area):
+            #   - Inside polygons  → always show Bankrot Bos (ground truth)
+            #   - Outside polygons → only show if confidence >= BANKROT_OUTSIDE_THRESHOLD
+            #
+            # CASE B — image does NOT overlap (different farm/area entirely):
+            #   - No spatial constraint applied
+            #   - Falls back to standard confidence threshold from DEMOTION_RULES
+            #   - Bankrot Bos can still be predicted if model is confident enough
+            #
+            # Tuning knobs:
+            #   BANKROT_OUTSIDE_THRESHOLD (0.92): raise → only show where drawn,
+            #     lower → allow more detections outside drawn polygons
+            #   inside force-paint threshold (0.40): lower → paint more of the
+            #     polygon interior, raise → only paint high-confidence interior px
+            BANKROT_OUTSIDE_THRESHOLD  = 0.92
+            BANKROT_INSIDE_MIN_CONF    = 0.40
+
+            if 'Bankrot Bos' in class_names:
+                bb_idx  = class_names.index('Bankrot Bos')
+                grs_idx = class_names.index('Grassland') if 'Grassland' in class_names else 0
+
+                try:
+                    bb_polys = gdf[gdf[CLASS_FIELD] == 'Bankrot Bos']
+
+                    # Check if the training polygons actually overlap this image
+                    # by comparing bounding boxes in the raster CRS.
+                    image_bounds = src.bounds  # (left, bottom, right, top)
+                    if len(bb_polys) > 0:
+                        poly_bounds = bb_polys.total_bounds  # (minx, miny, maxx, maxy)
+                        overlaps = (
+                            poly_bounds[0] < image_bounds.right  and
+                            poly_bounds[2] > image_bounds.left   and
+                            poly_bounds[1] < image_bounds.top    and
+                            poly_bounds[3] > image_bounds.bottom
+                        )
+                    else:
+                        overlaps = False
+
+                    if overlaps:
+                        # CASE A: image covers the Bankrot Bos survey area
+                        print("  Bankrot Bos spatial constraint: polygon zone overlaps image — applying constraint")
+                        bb_shapes = [
+                            (mapping(geom), 1)
+                            for geom in bb_polys.geometry
+                            if geom is not None and not geom.is_empty
+                        ]
+                        bankrot_zone = rasterio.features.rasterize(
+                            bb_shapes,
+                            out_shape=(height, width),
+                            transform=src.transform,
+                            fill=0,
+                            dtype=np.uint8,
+                        ).astype(bool)
+
+                        # Inside polygon zone → force-paint as Bankrot Bos
+                        # for any pixel with enough confidence
+                        inside_confident = (
+                            bankrot_zone &
+                            (prob_2d >= BANKROT_INSIDE_MIN_CONF) &
+                            ~no_data_2d
+                        )
+                        numeric_2d[inside_confident] = bb_idx
+
+                        # Outside polygon zone → very high confidence required
+                        outside_zone = ~bankrot_zone & ~no_data_2d
+                        low_conf_outside = (
+                            outside_zone &
+                            (numeric_2d == bb_idx) &
+                            (prob_2d < BANKROT_OUTSIDE_THRESHOLD)
+                        )
+                        numeric_2d[low_conf_outside] = grs_idx
+                        print(f"    {bankrot_zone.sum():,} px in polygon zone, "
+                              f"{low_conf_outside.sum():,} px outside demoted → Grassland")
+                    else:
+                        # CASE B: completely different image — no spatial constraint
+                        # Standard DEMOTION_RULES threshold already applied above
+                        print("  Bankrot Bos spatial constraint: polygon zone does NOT overlap "
+                              "this image — skipping constraint, using standard confidence threshold")
+
+                except Exception as e:
+                    print(f"  Bankrot Bos spatial constraint failed (non-fatal): {e}")
 
             # ── SMOOTHING & VISUALIZATION (Same as before) ──────────────────
             unique_classes = np.unique(numeric_2d[numeric_2d != 255])

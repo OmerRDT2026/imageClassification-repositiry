@@ -30,10 +30,23 @@ if exist "%PYTHON_EXE%" (
 REM ── STEP 2: Check for system Python ──────────────────────────────
 where python >nul 2>nul
 if not errorlevel 1 (
-    echo Found system Python.
-    set "PYTHON_EXE=python"
-    set "PIP_EXE=python -m pip"
-    goto :deps_check
+    REM Only trust system Python if its version is known to have
+    REM prebuilt packages ("wheels") for our dependencies (rasterio,
+    REM fiona/pyogrio, Pillow, etc). Very new Python releases often
+    REM do not yet, which forces pip to compile from source and
+    REM fail (needs GDAL headers, a C compiler, and other things a
+    REM normal machine does not have installed).
+    python -c "import sys; exit(0 if (3,9) <= sys.version_info[:2] <= (3,12) else 1)" >nul 2>nul
+    if not errorlevel 1 (
+        echo Found compatible system Python.
+        set "PYTHON_EXE=python"
+        set "PIP_EXE=python -m pip"
+        goto :deps_check
+    ) else (
+        echo System Python found but its version is not supported
+        echo by this app's dependencies ^(needs Python 3.9-3.12^).
+        echo Using a bundled, known-compatible Python instead.
+    )
 )
 
 REM ── STEP 3: No Python found — download embedded runtime ──────────
@@ -43,8 +56,11 @@ echo Downloading a self-contained Python runtime (~25 MB, one-time only)...
 echo This requires an internet connection.
 echo.
 
-REM Check internet connectivity first
-ping -n 1 google.com >nul 2>nul
+REM Check internet connectivity first. Using HTTP rather than ping: many
+REM institutional networks (schools, universities, corporate) block outbound
+REM ICMP for security reasons even when normal HTTP/internet access works
+REM fine, which would make a ping-based check falsely report no connection.
+powershell -Command "try{Invoke-WebRequest -Uri https://www.python.org -UseBasicParsing -TimeoutSec 5|Out-Null;exit 0}catch{exit 1}" >nul 2>nul
 if errorlevel 1 (
     echo.
     echo ERROR: No internet connection detected.
@@ -126,8 +142,8 @@ echo Installing dependencies ^(one-time, may take 2-5 minutes^)...
 echo Please wait — do not close this window.
 echo.
 
-REM Force correct fiona version to avoid geopandas compatibility issue
-"%PYTHON_EXE%" -m pip install fiona==1.9.5 --quiet --disable-pip-version-check
+REM No forced fiona install here -- app.py uses the pyogrio engine
+REM for reading vector files, which does not need fiona at all.
 "%PYTHON_EXE%" -m pip install -r "%REQUIREMENTS_FILE%" --quiet --disable-pip-version-check
 if errorlevel 1 (
     echo.
