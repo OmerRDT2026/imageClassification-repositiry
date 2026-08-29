@@ -276,9 +276,25 @@ NO_CROSS_IMAGE_BORROW = {
                       # date this was disabled and why
 }
 
+# Per-class override for how much extra confidence a class needs when it's
+# running on borrowed (no local ground truth) samples, on top of its normal
+# DEMOTION_RULES threshold. A class not listed here uses the default boost
+# in apply_demotion_rules(). Add an entry here — instead of blocking the
+# class in NO_CROSS_IMAGE_BORROW entirely — when a class still deserves a
+# chance to be predicted on a brand-new image, but the standard boost
+# hasn't proven strong enough. Water is the example: even at the default
+# +0.15 boost (0.65 base -> 0.80 effective), it was still confidently
+# painting dry ground blue when borrowing from its only available source
+# (an unrelated, distant farm) — raising the bar further here, rather than
+# refusing to predict it at all, keeps the attempt alive while demanding
+# near-certainty before it's allowed to stick.
+BORROWED_THRESHOLD_BOOST_OVERRIDES = {
+    'Water': 0.30,
+}
+
 
 def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
-                              only_classes=None):
+                              only_classes=None, reproj_cache=None):
     """Extract (X, y) training samples from ONE raster: reprojects the
     training polygons to that raster's own CRS, reads only the window
     covering them, rasterizes classes onto it, and computes features from
@@ -288,6 +304,16 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
     Pass only_classes to restrict which classes are rasterized/extracted —
     used when pulling fallback samples for just the handful of classes a
     "primary" image is missing, without re-extracting everything else.
+
+    Pass a shared reproj_cache dict (keyed by target CRS) when calling this
+    repeatedly in the same request — e.g. once per candidate file while
+    searching for cross-image fallback samples. Reprojecting the full
+    training GeoDataFrame is expensive (training_data.geojson has millions
+    of vertices), and most candidate files typically share the same CRS as
+    each other, so memoizing avoids redundantly repeating that reprojection
+    once per file. Filtering by only_classes happens AFTER reprojection
+    (cheap row selection) rather than before, so the cache holds one entry
+    per CRS regardless of which classes were requested.
 
     Returns (X, y, per_class_counts) — X/y may be empty arrays if nothing
     in this raster overlaps the requested classes. Any raster that can't be
@@ -303,15 +329,21 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
 
             band_roles, _ = detect_band_order(src)
 
-            gdf = gdf_32735
+            crs_key = str(src.crs)
+            if reproj_cache is not None:
+                if crs_key not in reproj_cache:
+                    reproj_cache[crs_key] = (
+                        gdf_32735.to_crs(src.crs) if gdf_32735.crs != src.crs else gdf_32735
+                    )
+                gdf = reproj_cache[crs_key]
+            else:
+                gdf = gdf_32735.to_crs(src.crs) if gdf_32735.crs != src.crs else gdf_32735
+
             if only_classes is not None:
                 gdf = gdf[gdf[CLASS_FIELD].isin(only_classes)]
                 if len(gdf) == 0:
                     print(f"  {raster_path}: no training polygons for {only_classes} at all -- skipping")
                     return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
-
-            if gdf.crs != src.crs:
-                gdf = gdf.to_crs(src.crs)
 
             minx, miny, maxx, maxy = gdf.total_bounds
             if not all(np.isfinite([minx, miny, maxx, maxy])):
@@ -329,9 +361,6 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
                       f"raster's pixel extent at all -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
-            window_transform = src.window_transform(window)
-            window_bands = src.read(window=window).astype(FEATURE_DTYPE)
-
             shapes = [
                 (mapping(geom), class_to_id[cls])
                 for geom, cls in zip(gdf.geometry, gdf[CLASS_FIELD])
@@ -341,33 +370,55 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
                 print(f"  {raster_path}: no valid (non-empty) training polygon geometries -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
-            label_arr = rasterio.features.rasterize(
-                shapes,
-                out_shape=(int(window.height), int(window.width)),
-                transform=window_transform,
-                fill=-1,
-                dtype=np.int32,
-            )
+            # Tile through the polygon-covering window in BLOCK_SIZE chunks
+            # rather than reading + computing features for it all in one
+            # array. A training polygon's bounding box can cover a huge
+            # fraction of a source image (millions of pixels), and doing
+            # that in one shot was causing intermittent "Unable to
+            # allocate ... MiB" failures under memory pressure — the same
+            # problem the main classification loop already solved with
+            # tiling, just never applied here.
+            X_parts, y_parts = [], []
+            w_row0, w_col0, w_h, w_w = window.row_off, window.col_off, window.height, window.width
+            for row_off in range(w_row0, w_row0 + w_h, BLOCK_SIZE):
+                for col_off in range(w_col0, w_col0 + w_w, BLOCK_SIZE):
+                    tile_h = min(BLOCK_SIZE, w_row0 + w_h - row_off)
+                    tile_w = min(BLOCK_SIZE, w_col0 + w_w - col_off)
+                    tile_window    = rasterio.windows.Window(col_off, row_off, tile_w, tile_h)
+                    tile_transform = src.window_transform(tile_window)
+                    tile_bands     = src.read(window=tile_window).astype(FEATURE_DTYPE)
 
-            blue  = window_bands[band_roles['blue']]
-            green = window_bands[band_roles['green']]
-            red   = window_bands[band_roles['red']]
-            nir   = window_bands[band_roles['nir']]
+                    label_arr = rasterio.features.rasterize(
+                        shapes,
+                        out_shape=(int(tile_h), int(tile_w)),
+                        transform=tile_transform,
+                        fill=-1,
+                        dtype=np.int32,
+                    )
 
-            no_data_flat   = compute_no_data_mask(blue, green, red, nir, nodata=src.nodata)
-            feature_matrix = compute_features(blue, green, red, nir)
-            finite_flat    = np.all(np.isfinite(feature_matrix), axis=1)
-            labels_flat    = label_arr.flatten()
+                    blue  = tile_bands[band_roles['blue']]
+                    green = tile_bands[band_roles['green']]
+                    red   = tile_bands[band_roles['red']]
+                    nir   = tile_bands[band_roles['nir']]
 
-            valid = (labels_flat >= 0) & ~no_data_flat & finite_flat
-            if not np.any(valid):
+                    no_data_flat   = compute_no_data_mask(blue, green, red, nir, nodata=src.nodata)
+                    feature_matrix = compute_features(blue, green, red, nir)
+                    finite_flat    = np.all(np.isfinite(feature_matrix), axis=1)
+                    labels_flat    = label_arr.flatten()
+
+                    valid = (labels_flat >= 0) & ~no_data_flat & finite_flat
+                    if np.any(valid):
+                        X_parts.append(feature_matrix[valid])
+                        y_parts.append(np.array(class_list, dtype=object)[labels_flat[valid]])
+
+            if not X_parts:
                 print(f"  {raster_path}: training polygon window overlaps this raster's "
                       f"extent, but every pixel under a polygon is either no-data or "
                       f"produced a non-finite feature -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
-            X = feature_matrix[valid]
-            y = np.array(class_list, dtype=object)[labels_flat[valid]]
+            X = np.vstack(X_parts)
+            y = np.concatenate(y_parts)
             counts = {cls: int(np.sum(y == cls)) for cls in np.unique(y)}
             return X, y, counts
     except Exception as e:
@@ -400,7 +451,8 @@ def apply_demotion_rules(pred_encoded, max_probs, class_names, borrowed_classes=
         if predicted_name in class_names and fallback_name in class_names:
             effective_threshold = threshold
             if predicted_name in borrowed_classes:
-                effective_threshold = min(0.9, threshold + BORROWED_THRESHOLD_BOOST)
+                boost = BORROWED_THRESHOLD_BOOST_OVERRIDES.get(predicted_name, BORROWED_THRESHOLD_BOOST)
+                effective_threshold = min(0.97, threshold + boost)
             pred_idx     = class_names.index(predicted_name)
             fallback_idx = class_names.index(fallback_name)
             uncertain    = (pred_encoded == pred_idx) & (max_probs < effective_threshold)
@@ -844,8 +896,18 @@ def classify_iap():
                 class_list   = sorted(gdf[CLASS_FIELD].unique())
                 class_to_id  = {c: i for i, c in enumerate(class_list)}
 
+                # Shared across every extract_training_samples() call in this
+                # request (primary image + every borrowing candidate below) —
+                # see that function's docstring for why this matters: without
+                # it, reprojecting training_data.geojson's millions of
+                # vertices gets repeated once per file, which is what was
+                # causing memory allocation failures once the borrowing loop
+                # started searching more files per request.
+                reproj_cache = {}
+
                 X, y, local_counts = extract_training_samples(
                     input_path, gdf, class_list, class_to_id,
+                    reproj_cache=reproj_cache,
                 )
                 # Deliberately not hard-failing here just because this image
                 # has zero local overlap — the cross-image borrowing loop
@@ -888,7 +950,7 @@ def classify_iap():
                             break
                         X_extra, y_extra, extra_counts = extract_training_samples(
                             other_path, gdf, class_list, class_to_id,
-                            only_classes=missing_classes,
+                            only_classes=missing_classes, reproj_cache=reproj_cache,
                         )
                         if X_extra.shape[0] == 0:
                             print(f"  No usable pixels from {os.path.basename(other_path)} "
@@ -899,10 +961,23 @@ def classify_iap():
                         y = np.concatenate([y, y_extra])
                         for cls, n in extra_counts.items():
                             training_sample_counts[cls] = training_sample_counts.get(cls, 0) + n
-                            borrowed_from.setdefault(cls, os.path.basename(other_path))
+                            if cls in borrowed_from:
+                                if os.path.basename(other_path) not in borrowed_from[cls].split(', '):
+                                    borrowed_from[cls] += f", {os.path.basename(other_path)}"
+                            else:
+                                borrowed_from[cls] = os.path.basename(other_path)
                         print(f"  Borrowed {dict(extra_counts)} training pixels from "
                               f"{os.path.basename(other_path)}")
-                        missing_classes = [c for c in missing_classes if training_sample_counts[c] == 0]
+                        # Keep a class in the search until it has a healthy
+                        # sample count, not just >0. A weak source found
+                        # first (e.g. a handful of pixels from an image that
+                        # only partially covers this class) would otherwise
+                        # satisfy the class and stop the search before a much
+                        # richer source later in the list ever gets tried.
+                        missing_classes = [
+                            c for c in missing_classes
+                            if training_sample_counts[c] < MAX_TRAIN_SAMPLES_PER_CLASS
+                        ]
 
                     if missing_classes:
                         print(f"Still no training pixels anywhere for: {missing_classes} — "
