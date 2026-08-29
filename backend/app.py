@@ -298,6 +298,7 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
     try:
         with rasterio.open(raster_path) as src:
             if src.count < 4:
+                print(f"  {raster_path}: only {src.count} bands, need >= 4 -- skipping as a training source")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             band_roles, _ = detect_band_order(src)
@@ -306,6 +307,7 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
             if only_classes is not None:
                 gdf = gdf[gdf[CLASS_FIELD].isin(only_classes)]
                 if len(gdf) == 0:
+                    print(f"  {raster_path}: no training polygons for {only_classes} at all -- skipping")
                     return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             if gdf.crs != src.crs:
@@ -313,6 +315,9 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
 
             minx, miny, maxx, maxy = gdf.total_bounds
             if not all(np.isfinite([minx, miny, maxx, maxy])):
+                print(f"  {raster_path}: training polygon bounds are not finite after "
+                      f"reprojecting to this raster's CRS ({src.crs}) -- likely a CRS "
+                      f"mismatch or an unusual/local CRS on this raster -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             window = rasterio.windows.from_bounds(
@@ -320,6 +325,8 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
             ).round_offsets().round_lengths()
             window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
             if window.width <= 0 or window.height <= 0:
+                print(f"  {raster_path}: training polygon extent does not overlap this "
+                      f"raster's pixel extent at all -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             window_transform = src.window_transform(window)
@@ -331,6 +338,7 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
                 if geom is not None and not geom.is_empty
             ]
             if not shapes:
+                print(f"  {raster_path}: no valid (non-empty) training polygon geometries -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             label_arr = rasterio.features.rasterize(
@@ -353,6 +361,9 @@ def extract_training_samples(raster_path, gdf_32735, class_list, class_to_id,
 
             valid = (labels_flat >= 0) & ~no_data_flat & finite_flat
             if not np.any(valid):
+                print(f"  {raster_path}: training polygon window overlaps this raster's "
+                      f"extent, but every pixel under a polygon is either no-data or "
+                      f"produced a non-finite feature -- skipping")
                 return np.empty((0, 9), dtype=FEATURE_DTYPE), np.array([], dtype=object), {}
 
             X = feature_matrix[valid]
@@ -769,6 +780,41 @@ def classify_iap():
             band_roles, _ = detect_band_order(src)
             model_path = model_path_for(file_id)
 
+            # Load training polygons once per request, regardless of which
+            # path (cached vs fresh-train) we take below — the Bankrot Bos
+            # spatial constraint further down needs them either way, and
+            # previously only existed inside the fresh-train branch, which
+            # meant it silently crashed (NameError, swallowed by a bare
+            # except) on every cache-hit request after the first.
+            if not os.path.exists(GEOJSON_PATH):
+                return jsonify({'error': f'Training polygons not found at {GEOJSON_PATH}'}), 500
+            try:
+                gdf = gpd.read_file(GEOJSON_PATH, engine='pyogrio')
+            except Exception:
+                gdf = gpd.read_file(GEOJSON_PATH)
+            gdf = gdf[gdf[CLASS_FIELD].notna()].copy()
+
+            # training_data.geojson's coordinates are written in EPSG:32735
+            # (UTM 35S) — declared via the legacy top-level "crs" member,
+            # which some GeoJSON readers ignore, silently assuming WGS84
+            # instead. Force the known-correct CRS explicitly rather than
+            # trusting whatever the file declares.
+            if gdf.crs is None or gdf.crs.to_epsg() != 32735:
+                print(f"Training GeoJSON CRS read as {gdf.crs}, expected EPSG:32735 — "
+                      f"forcing it explicitly rather than trusting the file's declared CRS.")
+                gdf = gdf.set_crs(epsg=32735, allow_override=True)
+
+            # Deliberately NOT reprojecting gdf to raster_crs here. Every
+            # extract_training_samples() call below reprojects its own local
+            # copy directly from gdf's CRS to whichever raster it's reading
+            # (see that function). Routing gdf through an intermediate
+            # reprojection to *this* image's CRS first — especially risky if
+            # this image has unusual/local georeferencing, which is common
+            # enough with drone outputs — was corrupting the polygon
+            # coordinates for every subsequent use in this request, including
+            # every seed-image fallback attempt. One direct hop per raster,
+            # always from the same known-good source CRS, avoids that.
+
             # ─ PATH A: PRE-TRAINED MODEL EXISTS AND MATCHES CURRENT DATA ──
             current_fingerprint = training_data_fingerprint()
             cached_model_is_fresh = False
@@ -794,34 +840,6 @@ def classify_iap():
             # ── PATH B: NO MODEL YET, OR IT'S STALE — TRAIN FROM GEOJSON ────
             if not cached_model_is_fresh:
                 print("Training from GeoJSON...")
-                if not os.path.exists(GEOJSON_PATH):
-                    return jsonify({'error': f'Training polygons not found at {GEOJSON_PATH}'}), 500
-
-                try:
-                    gdf = gpd.read_file(GEOJSON_PATH, engine='pyogrio')
-                except Exception:
-                    gdf = gpd.read_file(GEOJSON_PATH)
-                gdf = gdf[gdf[CLASS_FIELD].notna()].copy()
-
-                # training_data.geojson's coordinates are written in
-                # EPSG:32735 (UTM 35S) — declared via the legacy top-level
-                # "crs" member. Some GeoJSON readers (depending on the
-                # GDAL/pyogrio/fiona version in play) ignore that member
-                # entirely and silently assume WGS84 lon/lat instead. If that
-                # happens here, gdf.crs comes back as EPSG:4326 while the
-                # actual numbers are still UTM meters (e.g. x=436506) — values
-                # that are nonsense as longitude. Reprojecting nonsense
-                # coordinates through to_crs() below can then produce
-                # inf/NaN bounds, which is what was crashing with "cannot
-                # convert float infinity to integer" downstream. Forcing the
-                # known-correct CRS here sidesteps that ambiguity entirely.
-                if gdf.crs is None or gdf.crs.to_epsg() != 32735:
-                    print(f"Training GeoJSON CRS read as {gdf.crs}, expected EPSG:32735 — "
-                          f"forcing it explicitly rather than trusting the file's declared CRS.")
-                    gdf = gdf.set_crs(epsg=32735, allow_override=True)
-
-                if gdf.crs != raster_crs:
-                    gdf = gdf.to_crs(raster_crs)
 
                 class_list   = sorted(gdf[CLASS_FIELD].unique())
                 class_to_id  = {c: i for i, c in enumerate(class_list)}
@@ -829,33 +847,13 @@ def classify_iap():
                 X, y, local_counts = extract_training_samples(
                     input_path, gdf, class_list, class_to_id,
                 )
-                # If this image has zero local overlap with the training polygons,
-                # try seed images before giving up — this makes a fresh deployment
-                # work immediately without needing to upload the original images first.
-                if X.shape[0] == 0:
-                    print("No local training overlap — trying seed images as pixel source...")
-                    seed_files = [
-                        f for f in glob.glob(os.path.join(SEED_IMAGES_DIR, '*'))
-                        if os.path.isfile(f)
-                    ]
-                    for seed_path in seed_files:
-                        X_seed, y_seed, seed_counts = extract_training_samples(
-                            seed_path, gdf, class_list, class_to_id,
-                        )
-                        if X_seed.shape[0] > 0:
-                            X = X_seed
-                            y = y_seed
-                            local_counts = seed_counts
-                            print(f"  Bootstrapped training from seed image: {os.path.basename(seed_path)}")
-                            break
-
-                if X.shape[0] == 0:
-                    return jsonify({
-                        'error': 'Training polygons do not overlap this image and no seed images '
-                                 'are available. Add the original training rasters to '
-                                 'backend/seed_images/ so any image can be classified '
-                                 'on a fresh deployment.'
-                    }), 400
+                # Deliberately not hard-failing here just because this image
+                # has zero local overlap — the cross-image borrowing loop
+                # below (which also searches seed_images/) exists to handle
+                # exactly this case, including a brand-new image on a fresh
+                # deployment with nothing yet in uploads/. Only give up if,
+                # after attempting that, nothing usable exists anywhere
+                # (checked after the loop).
 
                 training_sample_counts = {cls: local_counts.get(cls, 0) for cls in class_list}
                 borrowed_from = {}  # class_name -> filename samples were pulled from
@@ -893,6 +891,9 @@ def classify_iap():
                             only_classes=missing_classes,
                         )
                         if X_extra.shape[0] == 0:
+                            print(f"  No usable pixels from {os.path.basename(other_path)} "
+                                  f"for {missing_classes} (see any 'Skipping ...' line above "
+                                  f"from extract_training_samples for the specific reason)")
                             continue
                         X = np.vstack([X, X_extra])
                         y = np.concatenate([y, y_extra])
@@ -906,6 +907,17 @@ def classify_iap():
                     if missing_classes:
                         print(f"Still no training pixels anywhere for: {missing_classes} — "
                               f"these classes will not be predictable on this image.")
+
+                # Only now, after trying every other uploaded image and every
+                # seed image, give up — this means no training data exists
+                # anywhere for any class on this image's footprint.
+                if X.shape[0] == 0:
+                    return jsonify({
+                        'error': 'No training data is available for this image — none of its pixels '
+                                 'overlap training_data.geojson, and neither do any other uploaded '
+                                 'or seed images. Add training rasters to backend/seed_images/, or '
+                                 'add training polygons for this location.'
+                    }), 400
 
                 print(f"Total training pixels per class (local + borrowed): {training_sample_counts}")
 
@@ -964,13 +976,21 @@ def classify_iap():
             no_data_2d = np.zeros((height, width), dtype=bool)
 
             if is_large_raster(src):
+                n_tiles_x   = (width  + BLOCK_SIZE - 1) // BLOCK_SIZE
+                n_tiles_y   = (height + BLOCK_SIZE - 1) // BLOCK_SIZE
+                total_tiles = n_tiles_x * n_tiles_y
+                tile_num    = 0
+                print(f"Classifying {total_tiles} tiles ({n_tiles_x} x {n_tiles_y}, "
+                      f"{BLOCK_SIZE}x{BLOCK_SIZE} each)...")
                 for row_off in range(0, height, BLOCK_SIZE):
                     for col_off in range(0, width, BLOCK_SIZE):
+                        tile_num += 1
                         win = rasterio.windows.Window(
                             col_off, row_off,
                             min(BLOCK_SIZE, width  - col_off),
                             min(BLOCK_SIZE, height - row_off),
                         )
+                        print(f"  Tile {tile_num}/{total_tiles}...")
                         block = src.read(window=win).astype(FEATURE_DTYPE)
                         blue  = block[band_roles['blue']]
                         green = block[band_roles['green']]
@@ -1026,17 +1046,13 @@ def classify_iap():
             # The model was trained on Bankrot Bos polygons drawn in a specific
             # area. Outside those polygons it can confuse shadows with Bankrot Bos.
             #
-            # This block detects whether the uploaded image actually overlaps the
-            # Bankrot Bos training polygon area:
-            #
-            # CASE A — image OVERLAPS training polygons (your survey area):
+            # This only ever runs when 'Bankrot Bos' is in class_names, which
+            # (because it's in NO_CROSS_IMAGE_BORROW) only happens when THIS
+            # image has real local Bankrot Bos training coverage — so in
+            # practice this block is always in the "image overlaps the
+            # training polygons" case:
             #   - Inside polygons  → always show Bankrot Bos (ground truth)
             #   - Outside polygons → only show if confidence >= BANKROT_OUTSIDE_THRESHOLD
-            #
-            # CASE B — image does NOT overlap (different farm/area entirely):
-            #   - No spatial constraint applied
-            #   - Falls back to standard confidence threshold from DEMOTION_RULES
-            #   - Bankrot Bos can still be predicted if model is confident enough
             #
             # Tuning knobs:
             #   BANKROT_OUTSIDE_THRESHOLD (0.92): raise → only show where drawn,
@@ -1052,6 +1068,13 @@ def classify_iap():
 
                 try:
                     bb_polys = gdf[gdf[CLASS_FIELD] == 'Bankrot Bos']
+                    # gdf is kept in its own CRS (EPSG:32735) for the rest of
+                    # this request (see the top-level loading comment above),
+                    # so reproject just this subset, locally, to match
+                    # src.bounds/src.transform below. This does not touch the
+                    # shared gdf used elsewhere.
+                    if len(bb_polys) > 0 and bb_polys.crs != src.crs:
+                        bb_polys = bb_polys.to_crs(src.crs)
 
                     # Check if the training polygons actually overlap this image
                     # by comparing bounding boxes in the raster CRS.
@@ -1112,6 +1135,7 @@ def classify_iap():
                     print(f"  Bankrot Bos spatial constraint failed (non-fatal): {e}")
 
             # ── SMOOTHING & VISUALIZATION (Same as before) ──────────────────
+            print("Classification done for all tiles — starting spatial smoothing...")
             unique_classes = np.unique(numeric_2d[numeric_2d != 255])
             if len(unique_classes) > 0:
                 kernel      = np.ones((3, 3), dtype=np.float32)
@@ -1126,6 +1150,7 @@ def classify_iap():
                 smoothed[no_data_2d] = 255
             else:
                 smoothed = numeric_2d.copy()
+            print("Smoothing done — building color output...")
 
             color_definitions = {
                 'Invasive':    {'base': [200,   0,   0], 'pale': [255, 220, 220]},
@@ -1155,12 +1180,14 @@ def classify_iap():
             if max(height, width) > PREVIEW_MAX_EDGE:
                 preview_img.thumbnail((PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE), Image.NEAREST)
             preview_img.save(iap_png_path, 'PNG')
+            print(f"Preview PNG saved: {iap_png_filename}")
 
             iap_tif_filename = f"{file_id}_iap.tif"
             iap_tif_path     = os.path.join(app.config['CONVERTED_FOLDER'], iap_tif_filename)
             rgb_profile = src.profile
             rgb_profile.update(dtype=rasterio.uint8, count=3, compress='lzw', nodata=0)
-            
+            print(f"Writing full-resolution result GeoTIFF: {iap_tif_filename}...")
+
             if is_large_raster(src):
                 with rasterio.open(iap_tif_path, 'w', **rgb_profile) as dst:
                     for row_off in range(0, height, BLOCK_SIZE):
@@ -1180,6 +1207,7 @@ def classify_iap():
                     dst.write(rgb[:, :, 0], 1)
                     dst.write(rgb[:, :, 1], 2)
                     dst.write(rgb[:, :, 2], 3)
+            print("GeoTIFF written. Building response...")
 
             # Classes that exist purely as an internal modeling detail (to
             # give the classifier a tighter decision boundary) but should be
@@ -1237,4 +1265,4 @@ def classify_iap():
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print("Starting Flask server...")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
