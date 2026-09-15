@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "5000"
+    volumes:
+      # Persist uploaded images and generated results across container
+      # restarts/rebuilds. training_data.geojson and seed_images/ are NOT
+      # volume-mounted — they're part of the git repo and get baked into
+      # the image on every build, which is exactly what you want: the
+      # image itself is always self-consistent with whatever's on GitHub.
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/converted:/app/backend/converted
+    environment:
+      # Matches this app's existing MAX_CONTENT_LENGTH env var (see app.py)
+      - MAX_UPLOAD_MB=2048

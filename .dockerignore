@@ -1,0 +1,13 @@
+.git
+.gitignore
+.gitattributes
+venv/
+.venv/
+python_runtime/
+__pycache__/
+*.pyc
+backend/uploads/
+backend/converted/
+backend/iap_model*.pkl
+run.bat
+README.md

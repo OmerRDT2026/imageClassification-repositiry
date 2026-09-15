@@ -1339,5 +1339,13 @@ def classify_iap():
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
+    # gunicorn (used in production/Docker — see Dockerfile) imports the
+    # `app` object directly and never runs this block at all, so this only
+    # matters if someone runs `python app.py` by hand. Defaults to debug
+    # mode on (unchanged local-dev behavior) unless FLASK_DEBUG=0 is set,
+    # which the Docker image's environment does — belt-and-suspenders
+    # against ever exposing Flask's debugger (a known remote-code-execution
+    # risk) if this ever gets run directly on a public-facing server.
+    debug_mode = os.environ.get('FLASK_DEBUG', '1') != '0'
     print("Starting Flask server...")
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    app.run(debug=debug_mode, host='0.0.0.0', port=5000, threaded=True)
