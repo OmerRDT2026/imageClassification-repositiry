@@ -1,5 +1,5 @@
 // Configuration
-const API_URL = 'http://localhost:5000/api';
+const API_URL = '/api';
 let currentFileId = null;
 
 // DOM Elements
@@ -96,15 +96,13 @@ async function handleFile(file) {
         const data = await uploadFileWithProgress(file);
         currentFileId = data.file_id;
 
+        // imageUrl already comes back as a relative path (e.g. "/api/uploads/xyz.png")
+        // from the backend -- no need to prepend a host at all, a relative path
+        // always resolves against whatever origin this page was loaded from.
         const imageUrl = data.converted_url || data.original_url;
-        let fullUrl;
-        if (imageUrl.startsWith('/api/api/')) {
-            fullUrl = `http://localhost:5000${imageUrl.replace('/api/api/', '/api/')}`;
-        } else if (imageUrl.startsWith('/api')) {
-            fullUrl = `http://localhost:5000${imageUrl}`;
-        } else {
-            fullUrl = `${API_URL}${imageUrl}`;
-        }
+        const fullUrl = imageUrl.startsWith('/api/api/')
+            ? imageUrl.replace('/api/api/', '/api/')
+            : imageUrl;
 
         showSuccessAndPreview(fullUrl, file, data);
 
@@ -289,11 +287,10 @@ if (ndviBtn) {
             const data = await response.json();
             
             if (data.success) {
-                const previewUrl = `http://localhost:5000${data.preview_url}`;
-                resultsImage.src = previewUrl;
-                
-                const downloadUrl = `http://localhost:5000${data.download_url}`;
-                downloadBtn.href = downloadUrl;
+                // preview_url/download_url already come back as relative paths
+                // (e.g. "/api/converted/xyz.png") -- use them directly.
+                resultsImage.src = data.preview_url;
+                downloadBtn.href = data.download_url;
                 
                 resultsTitle.textContent = 'NDVI Analysis Result';
                 resultsDescription.innerHTML = `
@@ -357,11 +354,10 @@ if (iapBtn) {
             const data = await response.json();
             
             if (data.success) {
-                const previewUrl = `http://localhost:5000${data.preview_url}`;
-                resultsImage.src = previewUrl;
-                
-                const downloadUrl = `http://localhost:5000${data.download_url}`;
-                downloadBtn.href = downloadUrl;
+                // preview_url/download_url already come back as relative paths
+                // -- use them directly, same as NDVI above.
+                resultsImage.src = data.preview_url;
+                downloadBtn.href = data.download_url;
                 
                 resultsTitle.textContent = 'IAP Classification Result';
                 resultsDescription.innerHTML = `
